@@ -59,6 +59,7 @@ function App() {
   const [modelProvider, setModelProvider] = useState('openai'); // 'openai' | 'gemini'
   const [libraryData, setLibraryData] = useState([]);
   const [saveStatus, setSaveStatus] = useState(null); // 'saving', 'saved', null
+  const [searchQuery, setSearchQuery] = useState('');
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState('');
   const [isChatLoading, setIsChatLoading] = useState(false);
@@ -527,6 +528,8 @@ function App() {
                   type="text"
                   placeholder="搜尋紀錄..."
                   className="bg-white border border-border rounded-xl py-2 pl-10 pr-4 focus:outline-none focus:border-primary/40 transition-all text-sm w-64 shadow-sm"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
                 />
               </div>
             </div>
@@ -549,74 +552,88 @@ function App() {
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {libraryData.map((item) => (
-                  <div key={item.id} className="bento-card bg-white group hover:border-primary/20">
-                    <div className="flex justify-between items-start mb-4">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2 text-xs text-text-muted font-medium uppercase tracking-wider">
-                          {item.url.includes('youtube.com') || item.url.includes('youtu.be') ? (
-                            <>
-                              <Youtube size={12} className="text-red-500" />
-                              <span>{item.url.includes('/shorts/') ? 'YouTube Shorts' : 'YouTube Video'}</span>
-                            </>
-                          ) : (
-                            <>
-                              <Instagram size={12} className="text-slate-400" />
-                              <span>Instagram Reel</span>
-                            </>
-                          )}
-                          <span>•</span>
-                          <span>{new Date(item.created_at).toLocaleDateString()}</span>
+                {libraryData
+                  .filter(item => {
+                    const query = searchQuery.toLowerCase();
+                    const label = (item.url.includes('youtube.com') || item.url.includes('youtu.be'))
+                      ? (item.url.includes('/shorts/') ? 'youtube shorts' : 'youtube video')
+                      : 'instagram reel';
+
+                    return (
+                      item.summary?.toLowerCase().includes(query) ||
+                      item.transcript?.toLowerCase().includes(query) ||
+                      item.url?.toLowerCase().includes(query) ||
+                      label.includes(query)
+                    );
+                  })
+                  .map((item) => (
+                    <div key={item.id} className="bento-card bg-white group hover:border-primary/20">
+                      <div className="flex justify-between items-start mb-4">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2 text-xs text-text-muted font-medium uppercase tracking-wider">
+                            {item.url.includes('youtube.com') || item.url.includes('youtu.be') ? (
+                              <>
+                                <Youtube size={12} className="text-red-500" />
+                                <span>{item.url.includes('/shorts/') ? 'YouTube Shorts' : 'YouTube Video'}</span>
+                              </>
+                            ) : (
+                              <>
+                                <Instagram size={12} className="text-slate-400" />
+                                <span>Instagram Reel</span>
+                              </>
+                            )}
+                            <span>•</span>
+                            <span>{new Date(item.created_at).toLocaleDateString()}</span>
+                          </div>
+                          <a
+                            href={item.url}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="text-primary text-sm font-semibold truncate block max-w-[200px] hover:underline flex items-center gap-1"
+                          >
+                            查看原文 <ExternalLink size={12} />
+                          </a>
                         </div>
-                        <a
-                          href={item.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-primary text-sm font-semibold truncate block max-w-[200px] hover:underline flex items-center gap-1"
-                        >
-                          查看原文 <ExternalLink size={12} />
-                        </a>
-                      </div>
-                      <button
-                        onClick={(e) => handleLibDelete(e, item.id)}
-                        className="p-2 text-red-500 hover:bg-red-50 rounded-lg transition-colors bg-red-50/50"
-                        title="刪除紀錄"
-                      >
-                        <Trash2 size={18} />
-                      </button>
-                    </div>
-
-                    <div className="space-y-4">
-                      <div>
-                        <h4 className="text-sm font-bold text-slate-800 flex items-center gap-1.5 mb-2">
-                          <Sparkles size={14} className="text-accent" />
-                          摘要回顧
-                        </h4>
-                        <p className="text-sm text-text-muted line-clamp-3 leading-relaxed">
-                          {item.summary}
-                        </p>
-                      </div>
-
-                      <div className="pt-4 border-t border-slate-50 flex gap-3">
                         <button
-                          onClick={() => {
-                            setResult(item);
-                            setView('home');
-                          }}
-                          className="text-xs font-bold text-primary bg-primary/5 px-4 py-2 rounded-lg hover:bg-primary/10 transition-colors"
+                          onClick={(e) => handleLibDelete(e, item.id)}
+                          className="p-2 text-red-500 hover:bg-red-50 rounded-lg transition-colors bg-red-50/50"
+                          title="刪除紀錄"
                         >
-                          查看詳情
-                        </button>
-                        <button
-                          onClick={() => copyToClipboard(item.transcript)}
-                          className="text-xs font-bold text-text-muted bg-slate-50 px-4 py-2 rounded-lg hover:bg-slate-100 transition-colors"
-                        >
-                          複製逐字稿
+                          <Trash2 size={18} />
                         </button>
                       </div>
+
+                      <div className="space-y-4">
+                        <div>
+                          <h4 className="text-sm font-bold text-slate-800 flex items-center gap-1.5 mb-2">
+                            <Sparkles size={14} className="text-accent" />
+                            摘要回顧
+                          </h4>
+                          <p className="text-sm text-text-muted line-clamp-3 leading-relaxed">
+                            {item.summary}
+                          </p>
+                        </div>
+
+                        <div className="pt-4 border-t border-slate-50 flex gap-3">
+                          <button
+                            onClick={() => {
+                              setResult(item);
+                              setView('home');
+                            }}
+                            className="text-xs font-bold text-primary bg-primary/5 px-4 py-2 rounded-lg hover:bg-primary/10 transition-colors"
+                          >
+                            查看詳情
+                          </button>
+                          <button
+                            onClick={() => copyToClipboard(item.transcript)}
+                            className="text-xs font-bold text-text-muted bg-slate-50 px-4 py-2 rounded-lg hover:bg-slate-100 transition-colors"
+                          >
+                            複製逐字稿
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))}
               </div>
             )}
           </div>
