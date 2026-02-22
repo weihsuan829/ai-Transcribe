@@ -1,0 +1,29 @@
+# Dependency directories
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Databases
+*.sqlite
+*.sqlite-journal
+library.sqlite淘汰
+
+# Uploads and temporary files
+backend/uploads/*
+!backend/uploads/.gitkeep
+backend/temp_long_*/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Build outputs
+/frontend/dist/
+/frontend/dist-ssr/
