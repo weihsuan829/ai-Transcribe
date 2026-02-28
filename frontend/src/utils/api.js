@@ -22,6 +22,21 @@ export const transcribeLongUrl = async (url, model = 'openai') => {
     }
 };
 
+export const transcribeFile = async (file, model = 'openai') => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('model', model);
+    try {
+        const response = await axios.post(`${API_BASE_URL}/transcribe-file`, formData, {
+            headers: { 'Content-Type': 'multipart/form-data' }
+        });
+        return response.data;
+    } catch (error) {
+        console.error('API Error:', error);
+        throw new Error(error.response?.data?.error || '檔案轉譯失敗，請檢查格式或檔案大小。');
+    }
+};
+
 export const saveToLibrary = async (data) => {
     try {
         const response = await axios.post(`${API_BASE_URL}/library/save`, data);
@@ -49,9 +64,14 @@ export const deleteFromHistory = async (id) => {
     }
 };
 
-export const sendChatMessage = async (message, threadId = null, model = 'openai') => {
+export const sendChatMessage = async (message, threadId = null, model = 'openai', tagId = null) => {
     try {
-        const response = await axios.post(`${API_BASE_URL}/chat`, { message, thread_id: threadId, model });
+        const response = await axios.post(`${API_BASE_URL}/chat`, {
+            message,
+            thread_id: threadId,
+            model,
+            tag_id: tagId
+        });
         return response.data;
     } catch (error) {
         throw new Error(error.response?.data?.error || 'Failed to send chat message');
@@ -94,9 +114,10 @@ export const getDocuments = async () => {
     }
 };
 
-export const uploadDocument = async (file) => {
+export const uploadDocument = async (file, tagId = null) => {
     const formData = new FormData();
     formData.append('file', file);
+    if (tagId) formData.append('tag_id', tagId);
     try {
         const response = await axios.post(`${API_BASE_URL}/documents/upload`, formData, {
             headers: { 'Content-Type': 'multipart/form-data' }
@@ -107,6 +128,24 @@ export const uploadDocument = async (file) => {
     }
 };
 
+export const updateLibraryTag = async (id, tagId) => {
+    try {
+        const response = await axios.patch(`${API_BASE_URL}/library/${id}/tag`, { tag_id: tagId });
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to update library tag');
+    }
+};
+
+export const updateDocumentTag = async (id, tagId) => {
+    try {
+        const response = await axios.patch(`${API_BASE_URL}/documents/${id}/tag`, { tag_id: tagId });
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to update document tag');
+    }
+};
+
 export const deleteDocument = async (id) => {
     try {
         const response = await axios.delete(`${API_BASE_URL}/documents/${id}`);
@@ -114,5 +153,48 @@ export const deleteDocument = async (id) => {
     } catch (error) {
         console.error('Delete API Error:', error);
         throw new Error(error.response?.data?.error || 'Failed to delete document');
+    }
+};
+
+// Tag Management
+export const getTags = async () => {
+    try {
+        const response = await axios.get(`${API_BASE_URL}/tags`);
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to fetch tags');
+    }
+};
+
+export const createTag = async (name) => {
+    try {
+        const response = await axios.post(`${API_BASE_URL}/tags`, { name });
+        return response.data;
+    } catch (error) {
+        throw new Error(error.response?.data?.error || 'Failed to create tag');
+    }
+};
+
+export const deleteTag = async (id) => {
+    try {
+        const response = await axios.delete(`${API_BASE_URL}/tags/${id}`);
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to delete tag');
+    }
+};
+
+export const processMeeting = async (audioBlob, model = 'openai') => {
+    const formData = new FormData();
+    formData.append('file', audioBlob, 'recording.webm');
+    formData.append('model', model);
+    try {
+        const response = await axios.post(`${API_BASE_URL}/meeting/process`, formData, {
+            headers: { 'Content-Type': 'multipart/form-data' }
+        });
+        return response.data;
+    } catch (error) {
+        console.error('Meeting Processing Error:', error);
+        throw new Error(error.response?.data?.error || '會議處理失敗');
     }
 };

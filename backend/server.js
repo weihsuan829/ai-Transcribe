@@ -63,14 +63,33 @@ db.exec(`
     embedding TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migration: Check if embedding column exists (in case table was created before)
 try {
     db.exec("ALTER TABLE saved_transcripts ADD COLUMN embedding TEXT");
-} catch (e) {
-    // Column already exists or other error
-}
+} catch (e) { }
+
+// Migration: Add tag_id to saved_transcripts
+try {
+    db.exec("ALTER TABLE saved_transcripts ADD COLUMN tag_id INTEGER REFERENCES tags(id) ON DELETE SET NULL");
+} catch (e) { }
+
+// Migration: Add cost to saved_transcripts
+try {
+    db.exec("ALTER TABLE saved_transcripts ADD COLUMN cost TEXT");
+} catch (e) { }
+
+// Migration: Add tag_id to documents
+try {
+    db.exec("ALTER TABLE documents ADD COLUMN tag_id INTEGER REFERENCES tags(id) ON DELETE SET NULL");
+} catch (e) { }
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -95,12 +114,34 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // Request Logging Middleware
 app.use((req, res, next) => {
     console.log(`${new Date().toISOString()} [${req.method}] ${req.url}`);
+    if (['POST', 'PATCH', 'PUT'].includes(req.method)) {
+        console.log('Body:', JSON.stringify(req.body, null, 2));
+    }
     next();
 });
+
+app.get('/api/ping', (req, res) => res.json({ message: 'pong', timestamp: new Date().toISOString() }));
 
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
 });
+
+// OpenAI/Gemini Pricing Constants (USD)
+const PRICING = {
+    'gpt-4o-mini': { input: 0.15 / 1000000, output: 0.60 / 1000000 },
+    'whisper-1': { minute: 0.006 },
+    'text-embedding-3-small': { input: 0.02 / 1000000 },
+    'gemini-flash-latest': { input: 0.10 / 1000000, output: 0.40 / 1000000 } // Approximate
+};
+
+function calculateCost(model, usage) {
+    if (!usage || !PRICING[model]) return 0;
+    const rates = PRICING[model];
+    if (rates.input && rates.output) {
+        return (usage.prompt_tokens * rates.input) + (usage.completion_tokens * rates.output);
+    }
+    return 0;
+}
 
 app.post('/api/transcribe', async (req, res) => {
     const { url } = req.body;
@@ -159,26 +200,33 @@ app.post('/api/transcribe', async (req, res) => {
             file: fs.createReadStream(audioPath),
             model: "whisper-1",
             language: "zh",
+            response_format: "verbose_json"
         });
 
-        console.log('Transcription complete');
+        console.log(`Transcription complete. Duration: ${transcription.duration}s`);
 
         // Step 3: Summarize using selected model
         const selectedModel = req.body.model || 'openai';
         const systemPrompt = "你是一個專業的影音轉型文字助手。請將下方的逐字稿整理成：1. 核心重點（列表） 2. 摘要 3. 建議。請使用繁體中文。";
         console.log(`Using ${selectedModel} for summarization`);
 
-        let summary;
+        let summaryData;
         if (selectedModel === 'gemini') {
-            summary = await generateText('gemini', transcription.text, systemPrompt);
+            summaryData = await generateText('gemini', transcription.text, systemPrompt);
         } else {
-            summary = await generateText('openai', transcription.text, systemPrompt);
+            summaryData = await generateText('openai', transcription.text, systemPrompt);
         }
+
+        const gptCost = calculateCost(selectedModel === 'gemini' ? 'gemini-flash-latest' : 'gpt-4o-mini', summaryData.usage);
+        const whisperCost = (transcription.duration || 0) / 60 * PRICING['whisper-1'].minute;
 
         res.json({
             transcript: transcription.text,
-            summary: summary
+            summary: summaryData.text,
+            usage: summaryData.usage,
+            cost: (gptCost + whisperCost).toFixed(6)
         });
+        console.log(`Response sent. Usage: ${JSON.stringify(summaryData.usage)}, Total Cost: ${gptCost + whisperCost}`);
 
     } catch (error) {
         console.error('Error during transcription:', error);
@@ -230,6 +278,7 @@ app.post('/api/transcribe-long', async (req, res) => {
 
         // Step 3: Transcribe chunks sequentially to avoid rate limits
         let fullTranscript = '';
+        let totalWhisperDuration = 0;
         for (let i = 0; i < chunks.length; i++) {
             const chunkPath = path.join(workingDir, chunks[i]);
             console.log(`Transcribing chunk ${i + 1}/${chunks.length}...`);
@@ -238,9 +287,11 @@ app.post('/api/transcribe-long', async (req, res) => {
                 file: fs.createReadStream(chunkPath),
                 model: "whisper-1",
                 language: "zh",
+                response_format: "verbose_json"
             });
 
             fullTranscript += `[時段 ${i * 10}:00 - ${(i + 1) * 10}:00]\n${transcription.text}\n\n`;
+            totalWhisperDuration += (transcription.duration || 0);
         }
 
         // Step 4: Summarize the whole thing
@@ -248,12 +299,18 @@ app.post('/api/transcribe-long', async (req, res) => {
         const systemPrompt = "你是一個專業的影音轉型文字助手。這是一段長影片的逐字稿，請將其整理成：1. 核心重點（列表） 2. 整體摘要 3. 逐段重點 4. 關鍵結論。請使用繁體中文。";
 
         console.log(`Summarizing long transcript with ${selectedModel}...`);
-        const summary = await generateText(selectedModel, fullTranscript, systemPrompt);
+        const summaryData = await generateText(selectedModel, fullTranscript, systemPrompt);
+
+        const gptCost = calculateCost(selectedModel === 'gemini' ? 'gemini-flash-latest' : 'gpt-4o-mini', summaryData.usage);
+        const whisperCost = (totalWhisperDuration / 60) * PRICING['whisper-1'].minute;
 
         res.json({
             transcript: fullTranscript,
-            summary: summary
+            summary: summaryData.text,
+            usage: summaryData.usage,
+            cost: (gptCost + whisperCost).toFixed(6)
         });
+        console.log(`Response sent. Usage: ${JSON.stringify(summaryData.usage)}, Total Cost: ${gptCost + whisperCost}`);
 
     } catch (error) {
         console.error('Error during long transcription:', error);
@@ -269,10 +326,165 @@ app.post('/api/transcribe-long', async (req, res) => {
         }
     }
 });
+app.post('/api/transcribe-file', upload.single('file'), async (req, res) => {
+    // Set a very long timeout
+    req.setTimeout(600000); // 10 minutes
 
+    if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const inputPath = req.file.path;
+    const originalName = req.file.originalname;
+    const fileType = req.file.mimetype;
+    const tempId = Date.now();
+    const workingDir = path.join(__dirname, `temp_file_${tempId}`);
+
+    try {
+        if (!fs.existsSync(workingDir)) fs.mkdirSync(workingDir);
+
+        console.log(`Processing uploaded file: ${originalName} (${fileType})`);
+
+        let audioPath = inputPath;
+
+        // Step 1: Extract audio if it's a video file
+        if (fileType.startsWith('video/')) {
+            console.log('Extracting audio from video file...');
+            const extractedAudioPath = path.join(workingDir, 'extracted_audio.mp3');
+            await execPromise(`ffmpeg -i "${inputPath}" -vn -acodec libmp3lame -q:a 2 "${extractedAudioPath}"`);
+            audioPath = extractedAudioPath;
+        }
+
+        // Step 2: Transcribe (handle large files if needed, but for simplicity we keep it single or segmented)
+        let fullTranscript = '';
+        let totalWhisperDuration = 0;
+
+        if (fileSizeInMB > 24) {
+            console.log(`File size ${fileSizeInMB.toFixed(2)}MB exceeds 25MB limit. Chunking...`);
+            // Split audio into 10-minute chunks (similar to long video logic)
+            const segmentTemplate = path.join(workingDir, 'chunk_%03d.mp3');
+            await execPromise(`ffmpeg -i "${audioPath}" -f segment -segment_time 600 -c:a libmp3lame "${segmentTemplate}"`);
+
+            const chunks = fs.readdirSync(workingDir)
+                .filter(f => f.startsWith('chunk_') && f.endsWith('.mp3'))
+                .sort();
+
+            console.log(`Split into ${chunks.length} chunks. Starting transcription...`);
+
+            for (let i = 0; i < chunks.length; i++) {
+                const chunkPath = path.join(workingDir, chunks[i]);
+                console.log(`Transcribing chunk ${i + 1}/${chunks.length}...`);
+
+                const transcription = await openai.audio.transcriptions.create({
+                    file: fs.createReadStream(chunkPath),
+                    model: "whisper-1",
+                    language: "zh",
+                    response_format: "verbose_json"
+                });
+
+                fullTranscript += `[時段 ${i * 10}:00 - ${(i + 1) * 10}:00]\n${transcription.text}\n\n`;
+                totalWhisperDuration += (transcription.duration || 0);
+            }
+        } else {
+            console.log('Transcribing single file...');
+            const transcription = await openai.audio.transcriptions.create({
+                file: fs.createReadStream(audioPath),
+                model: "whisper-1",
+                language: "zh",
+                response_format: "verbose_json"
+            });
+            fullTranscript = transcription.text;
+            totalWhisperDuration = (transcription.duration || 0);
+        }
+
+        // Step 3: Summarize
+        const selectedModel = req.body.model || 'openai';
+        const systemPrompt = "你是一個專業的影音轉型文字助手。這是一段錄音或影片的逐字稿，請將其整理成：1. 核心重點（列表） 2. 整體摘要 3. 逐段重點 4. 關鍵結論。請使用繁體中文。";
+
+        console.log(`Summarizing file transcript with ${selectedModel}...`);
+        const summaryData = await generateText(selectedModel, fullTranscript, systemPrompt);
+
+        const gptCost = calculateCost(selectedModel === 'gemini' ? 'gemini-flash-latest' : 'gpt-4o-mini', summaryData.usage);
+        const whisperCost = (totalWhisperDuration / 60) * PRICING['whisper-1'].minute;
+
+        res.json({
+            transcript: fullTranscript,
+            summary: summaryData.text,
+            originalName: originalName,
+            usage: summaryData.usage,
+            cost: (gptCost + whisperCost).toFixed(6)
+        });
+        console.log(`Response sent. Usage: ${JSON.stringify(summaryData.usage)}, Total Cost: ${gptCost + whisperCost}`);
+
+    } catch (error) {
+        console.error('Error during file transcription:', error);
+        res.status(500).json({ error: error.message || 'Failed to process file' });
+    } finally {
+        // Cleanup: remove original uploaded file and the temp directory
+        try {
+            if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+            if (fs.existsSync(workingDir)) fs.rmSync(workingDir, { recursive: true, force: true });
+        } catch (e) {
+            console.error('Cleanup error:', e);
+        }
+    }
+});
+
+app.post('/api/meeting/process', upload.single('file'), async (req, res) => {
+    if (!req.file) {
+        console.error('Meeting process: No file in request');
+        return res.status(400).json({ error: 'No recording file received' });
+    }
+
+    console.log(`Meeting process: Received file ${req.file.originalname}, size: ${req.file.size}`);
+
+    const inputPath = req.file.path;
+    const selectedModel = req.body.model || 'openai';
+
+    try {
+        console.log(`Processing meeting recording using model: ${selectedModel}`);
+
+        // Step 1: Transcribe using Whisper
+        const transcription = await openai.audio.transcriptions.create({
+            file: fs.createReadStream(inputPath),
+            model: "whisper-1",
+            language: "zh",
+            response_format: "verbose_json"
+        });
+
+        // Step 2: Summarize with Meeting Focus
+        const systemPrompt = "你是一個專業的會議記錄助手。請根據逐字稿整理出：1. 會議核心議題 2. 重點討論細節 3. 決議事項與 Action Items。請使用繁體中文。";
+        const summaryData = await generateText(selectedModel, transcription.text, systemPrompt);
+
+        console.log('Meeting process: Sending response');
+        const gptCost = calculateCost(selectedModel === 'gemini' ? 'gemini-flash-latest' : 'gpt-4o-mini', summaryData.usage);
+        const whisperCost = (transcription.duration || 0) / 60 * PRICING['whisper-1'].minute;
+
+        res.json({
+            transcript: transcription.text,
+            summary: summaryData.text,
+            url: '即時會議錄音',
+            usage: summaryData.usage,
+            cost: (gptCost + whisperCost).toFixed(6)
+        });
+        console.log(`Response sent. Usage: ${JSON.stringify(summaryData.usage)}, Total Cost: ${gptCost + whisperCost}`);
+
+    } catch (error) {
+        console.error('Error processing meeting:', error);
+        res.status(500).json({ error: error.message || 'Failed to process meeting recording' });
+    } finally {
+        if (fs.existsSync(inputPath)) {
+            try {
+                fs.unlinkSync(inputPath);
+            } catch (e) {
+                console.error('Cleanup error:', e);
+            }
+        }
+    }
+});
 // Library Endpoints
 app.post('/api/library/save', async (req, res) => {
-    const { url, transcript, summary } = req.body;
+    const { url, transcript, summary, tag_id, cost } = req.body;
 
     if (!url || !transcript || !summary) {
         return res.status(400).json({ error: 'Missing required data' });
@@ -280,7 +492,7 @@ app.post('/api/library/save', async (req, res) => {
 
     try {
         // Stage 1: Immediate save without embedding
-        const info = db.prepare('INSERT INTO saved_transcripts (url, transcript, summary, embedding) VALUES (?, ?, ?, NULL)').run(url, transcript, summary);
+        const info = db.prepare('INSERT INTO saved_transcripts (url, transcript, summary, embedding, tag_id, cost) VALUES (?, ?, ?, NULL, ?, ?)').run(url, transcript, summary, tag_id || null, cost || null);
         const recordId = info.lastInsertRowid;
 
         // Return success immediately to the client
@@ -335,6 +547,52 @@ app.delete('/api/library/:id', (req, res) => {
     }
 });
 
+app.patch('/api/library/:id/tag', (req, res) => {
+    const { id } = req.params;
+    const { tag_id } = req.body;
+    try {
+        db.prepare('UPDATE saved_transcripts SET tag_id = ? WHERE id = ?').run(tag_id || null, id);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to update tag' });
+    }
+});
+
+// Tag Management Endpoints
+app.get('/api/tags', (req, res) => {
+    try {
+        const rows = db.prepare('SELECT * FROM tags ORDER BY name ASC').all();
+        res.json(rows);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch tags' });
+    }
+});
+
+app.post('/api/tags', (req, res) => {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: 'Tag name is required' });
+    try {
+        const info = db.prepare('INSERT INTO tags (name) VALUES (?)').run(name);
+        res.json({ id: info.lastInsertRowid, name });
+    } catch (error) {
+        if (error.code === 'SQLITE_CONSTRAINT') {
+            res.status(400).json({ error: '標籤名稱已存在' });
+        } else {
+            res.status(500).json({ error: 'Failed to create tag' });
+        }
+    }
+});
+
+app.delete('/api/tags/:id', (req, res) => {
+    const { id } = req.params;
+    try {
+        db.prepare('DELETE FROM tags WHERE id = ?').run(id);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to delete tag' });
+    }
+});
+
 // Helper for Cosine Similarity
 function cosineSimilarity(vecA, vecB) {
     let dotProduct = 0;
@@ -356,16 +614,26 @@ async function generateText(provider, prompt, systemInstruction) {
 
         let parts = [{ text: prompt }];
         if (systemInstruction) {
-            // Gemini doesn't strictly have system roles in the same way, but prepending works well
             parts = [{ text: systemInstruction }, { text: prompt }];
         }
 
         const result = await model.generateContent(parts);
         const response = await result.response;
-        return response.text();
+        const usage = {
+            prompt_tokens: response.usageMetadata?.promptTokenCount || 0,
+            completion_tokens: response.usageMetadata?.candidatesTokenCount || 0,
+            total_tokens: response.usageMetadata?.totalTokenCount || 0
+        };
+        return { text: response.text(), usage };
     } else {
         // Default to OpenAI
-        const messages = [{ role: "user", content: prompt }];
+        let messages;
+        if (Array.isArray(prompt)) {
+            messages = [...prompt];
+        } else {
+            messages = [{ role: "user", content: prompt }];
+        }
+
         if (systemInstruction) {
             messages.unshift({ role: "system", content: systemInstruction });
         }
@@ -374,12 +642,16 @@ async function generateText(provider, prompt, systemInstruction) {
             model: "gpt-4o-mini",
             messages: messages,
         });
-        return completion.choices[0].message.content;
+
+        return {
+            text: completion.choices[0].message.content,
+            usage: completion.usage
+        };
     }
 }
 
 app.post('/api/chat', async (req, res) => {
-    let { message, thread_id, model = 'openai' } = req.body;
+    let { message, thread_id, model = 'openai', tag_id } = req.body;
 
     if (!message) {
         return res.status(400).json({ error: 'Message is required' });
@@ -405,8 +677,21 @@ app.post('/api/chat', async (req, res) => {
         const queryVector = queryEmbeddingResponse.data[0].embedding;
 
         // 4. Fetch all sources with embeddings
-        const transcripts = db.prepare("SELECT id, url as source_url, transcript as content, embedding, 'reel' as type FROM saved_transcripts WHERE embedding IS NOT NULL").all();
-        const documents = db.prepare("SELECT id, name, filename, content, embedding, 'doc' as type FROM documents WHERE embedding IS NOT NULL").all();
+        let transcriptQuery = "SELECT id, url as source_url, transcript as content, embedding, 'reel' as type, created_at FROM saved_transcripts WHERE embedding IS NOT NULL";
+        let docQuery = "SELECT id, name, filename, content, embedding, 'doc' as type, created_at FROM documents WHERE embedding IS NOT NULL";
+
+        let transcripts, documents;
+
+        if (tag_id) {
+            transcriptQuery += " AND tag_id = ?";
+            transcripts = db.prepare(transcriptQuery).all(tag_id);
+
+            docQuery += " AND tag_id = ?";
+            documents = db.prepare(docQuery).all(tag_id);
+        } else {
+            transcripts = db.prepare(transcriptQuery).all();
+            documents = db.prepare(docQuery).all();
+        }
 
         const allSources = [...transcripts, ...documents];
 
@@ -422,43 +707,56 @@ app.post('/api/chat', async (req, res) => {
                 console.error(`Error parsing embedding for source ${source.id}:`, parseError);
                 return { ...source, similarity: 0 };
             }
-        }).sort((a, b) => b.similarity - a.similarity).slice(0, 5);
+        }).sort((a, b) => b.similarity - a.similarity).slice(0, 10);
 
         // 6. Construct Context
         const context = rankedResults.length > 0
-            ? rankedResults.map(r => `[來源: ${r.type === 'reel' ? 'Reel URL' : '文件名稱'}: ${r.type === 'reel' ? r.source_url : r.name}]\n${r.content}`).join('\n\n---\n\n')
+            ? rankedResults.map(r => `[來源: ${r.type === 'reel' ? 'Reel URL' : '文件名稱'}: ${r.type === 'reel' ? r.source_url : r.name}] (存入日期: ${new Date(r.created_at).toLocaleString('zh-TW')})\n${r.content}`).join('\n\n---\n\n')
             : "資料庫中沒有相關資訊。";
 
         // 7. Auto-generate title if it's the first message
         if (isNewThread) {
-            const newTitle = await generateText(model, `針對以下提問縮短成一個 3-5 字的標題：${message}`);
-            db.prepare('UPDATE chat_threads SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newTitle.replace(/["'「」]/g, ''), thread_id);
+            const titleData = await generateText(model, `針對以下提問縮短成一個 3-5 字的標題：${message}`);
+            db.prepare('UPDATE chat_threads SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(titleData.text.replace(/["'「」]/g, ''), thread_id);
         } else {
             db.prepare('UPDATE chat_threads SET updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(thread_id);
         }
 
         // 8. Prepare Prompt for Generation
-        const systemPrompt = "你是一個專業助手。你的背景知識庫包含 Instagram 影音逐字稿與上傳的文件資料。請優先根據資料庫內容回答，並參考歷史脈絡。請使用繁體中文。\n背景知識資料庫內容：\n" + context;
+        const systemPrompt = `你是一個專業助手。你的背景知識庫包含 Instagram 影音逐字稿與上傳的文件資料。
+請優先根據資料庫內容回答，並參考歷史脈絡。請使用繁體中文。
 
-        let answer;
+**重要日期規範**：
+1. 每一則資料都有標註「存入日期」。
+2. 當使用者詢問特定日期（如「2月23日」）的內容時，你**必須**僅比對標註為該日期的資料。
+3. 如果資料庫中該日期的內容與使用者的問題不符，請誠實回答「資料庫中 2/23 的資料與此主題無關」或「找不到該日期的相關紀錄」，絕對**不可以**拿其他日期（如 2/22）的內容來充數。
+4. 在回答中，請適時提及你參考的是哪一個日期的資料。
+
+背景知識資料庫內容：
+${context}`;
+
+        let answerText;
+        let chatUsage;
         if (model === 'gemini') {
             // Construct history string or use robust chat session (basic concatenation for now)
             let messagesStr = history.map(h => `${h.role}: ${h.content}`).join('\n');
             const fullPrompt = `${messagesStr}\nuser: ${message}`;
-            answer = await generateText('gemini', fullPrompt, systemPrompt);
+            const result = await generateText('gemini', fullPrompt, systemPrompt);
+            answerText = result.text;
+            chatUsage = result.usage;
         } else {
             // OpenAI Format
             const chatMessagesForGPT = [
-                { role: "system", content: systemPrompt },
                 ...history,
                 { role: "user", content: message }
             ];
-            const completion = await openai.chat.completions.create({
-                model: "gpt-4o-mini",
-                messages: chatMessagesForGPT,
-            });
-            answer = completion.choices[0].message.content;
+            const result = await generateText('openai', chatMessagesForGPT, systemPrompt);
+            answerText = result.text;
+            chatUsage = result.usage;
         }
+
+        const gptCost = calculateCost(model === 'gemini' ? 'gemini-flash-latest' : 'gpt-4o-mini', chatUsage);
+        const embeddingCost = (queryVector.length * 4) / 1000000 * PRICING['text-embedding-3-small'].input; // Rough estimate for embedding cost
 
         const sourcesData = rankedResults.map(r => ({
             id: r.id,
@@ -470,17 +768,19 @@ app.post('/api/chat', async (req, res) => {
 
         // 10. Save User and AI messages to history
         db.prepare('INSERT INTO chat_messages (thread_id, role, content) VALUES (?, ?, ?)').run(thread_id, 'user', message);
-        db.prepare('INSERT INTO chat_messages (thread_id, role, content, sources) VALUES (?, ?, ?, ?)').run(thread_id, 'assistant', answer, sources);
+        db.prepare('INSERT INTO chat_messages (thread_id, role, content, sources) VALUES (?, ?, ?, ?)').run(thread_id, 'assistant', answerText, sources);
 
         res.json({
             thread_id,
-            answer,
+            answer: answerText,
             sources: rankedResults.map(r => ({
                 id: r.id,
                 url: r.type === 'reel' ? r.source_url : `http://localhost:3001/uploads/${r.filename}`,
                 name: r.type === 'reel' ? 'Reel 原文' : r.name,
                 type: r.type
-            }))
+            })),
+            usage: chatUsage,
+            cost: (gptCost + embeddingCost).toFixed(6)
         });
 
     } catch (error) {
@@ -559,9 +859,11 @@ app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
             } else if (req.file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
                 const result = await mammoth.extractRawText({ path: filePath });
                 textContent = result.value;
+            } else if (req.file.mimetype === 'text/plain') {
+                textContent = fs.readFileSync(filePath, 'utf8');
             } else {
                 if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-                return res.status(400).json({ error: '不支援的檔案格式，請上傳 PDF 或 Word 檔案。' });
+                return res.status(400).json({ error: '不支援的檔案格式，請上傳 PDF、Word 或 TXT 檔案。' });
             }
         } catch (parseError) {
             console.error('Parsing Error:', parseError);
@@ -589,12 +891,13 @@ app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
 
             console.log('Saving document to database...');
             const originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
-            const result = db.prepare('INSERT INTO documents (name, filename, type, content, embedding) VALUES (?, ?, ?, ?, ?)').run(
+            const result = db.prepare('INSERT INTO documents (name, filename, type, content, embedding, tag_id) VALUES (?, ?, ?, ?, ?, ?)').run(
                 originalName,
                 req.file.filename,
                 req.file.mimetype,
                 textContent,
-                embedding
+                embedding,
+                tag_id || null
             );
             console.log(`Document saved with ID: ${result.lastInsertRowid}`);
 
@@ -617,10 +920,21 @@ app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
 
 app.get('/api/documents', (req, res) => {
     try {
-        const docs = db.prepare('SELECT id, name, filename, type, content, created_at FROM documents ORDER BY created_at DESC').all();
+        const docs = db.prepare('SELECT id, name, filename, type, content, tag_id, created_at FROM documents ORDER BY created_at DESC').all();
         res.json(docs);
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch documents' });
+    }
+});
+
+app.patch('/api/documents/:id/tag', (req, res) => {
+    const { id } = req.params;
+    const { tag_id } = req.body;
+    try {
+        db.prepare('UPDATE documents SET tag_id = ? WHERE id = ?').run(tag_id || null, id);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to update tag' });
     }
 });
 
