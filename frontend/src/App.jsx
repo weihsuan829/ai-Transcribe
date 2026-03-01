@@ -47,7 +47,9 @@ import {
   getTags,
   createTag,
   deleteTag,
-  processMeeting
+  processMeeting,
+  batchDeleteDocuments,
+  batchUpdateDocumentTags
 } from './utils/api';
 
 const BentoCard = ({ children, title, icon: Icon, className = "" }) => (
@@ -111,6 +113,11 @@ function App() {
   const [deletingIds, setDeletingIds] = useState(new Set());
   const [selectedDocTagId, setSelectedDocTagId] = useState('');
   const [errorMessage, setErrorMessage] = useState(null);
+  // Batch Operations State
+  const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+  const [selectedDocIds, setSelectedDocIds] = useState(new Set());
+  const [isBatchTagModalOpen, setIsBatchTagModalOpen] = useState(false);
+  const [batchTagId, setBatchTagId] = useState('');
   const [previewDoc, setPreviewDoc] = useState(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [threadToDelete, setThreadToDelete] = useState(null);
@@ -293,6 +300,48 @@ function App() {
       });
       setShowDocDeleteConfirm(false);
       setDocToDelete(null);
+    }
+  };
+
+  const handleToggleMultiSelect = () => {
+    setIsMultiSelectMode(!isMultiSelectMode);
+    setSelectedDocIds(new Set());
+  };
+
+  const handleSelectDoc = (id) => {
+    const newSelected = new Set(selectedDocIds);
+    if (newSelected.has(id)) {
+      newSelected.delete(id);
+    } else {
+      newSelected.add(id);
+    }
+    setSelectedDocIds(newSelected);
+  };
+
+  const handleBatchDelete = async () => {
+    if (selectedDocIds.size === 0) return;
+    if (window.confirm(`確定要刪除這 ${selectedDocIds.size} 份文件嗎？`)) {
+      try {
+        await batchDeleteDocuments(Array.from(selectedDocIds));
+        fetchDocuments();
+        setSelectedDocIds(new Set());
+        setIsMultiSelectMode(false);
+      } catch (err) {
+        setErrorMessage('批次刪除失敗');
+      }
+    }
+  };
+
+  const handleBatchTagUpdate = async () => {
+    if (selectedDocIds.size === 0 || !batchTagId) return;
+    try {
+      await batchUpdateDocumentTags(Array.from(selectedDocIds), batchTagId);
+      fetchDocuments();
+      setSelectedDocIds(new Set());
+      setIsMultiSelectMode(false);
+      setIsBatchTagModalOpen(false);
+    } catch (err) {
+      setErrorMessage('批次更新分類失敗');
     }
   };
 
@@ -1112,6 +1161,13 @@ function App() {
                   onChange={handleDocUpload}
                   onClick={(e) => { e.target.value = null; }}
                 />
+                <button
+                  onClick={handleToggleMultiSelect}
+                  className={`flex items-center gap-2 px-5 py-3 rounded-2xl text-sm font-semibold border transition-all ${isMultiSelectMode ? 'bg-primary text-white border-primary shadow-lg shadow-primary/20' : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-50'}`}
+                >
+                  <CheckCircle2 size={18} />
+                  <span>{isMultiSelectMode ? '取消選取' : '多選管理'}</span>
+                </button>
               </div>
             </div>
 
@@ -1137,9 +1193,20 @@ function App() {
               </div>
             ) : (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {documentList.map((doc) => (
-                  <div key={doc.id} className="bento-card bg-white group hover:border-primary/20 transition-all hover:shadow-soft-xl">
-                    <div className="flex justify-between items-start mb-6">
+                {documentList.map(doc => (
+                  <div
+                    key={doc.id}
+                    onClick={() => isMultiSelectMode && handleSelectDoc(doc.id)}
+                    className={`bento-card bg-white group hover:border-primary/30 transition-all p-6 relative flex flex-col justify-between ${isMultiSelectMode ? 'cursor-pointer' : ''} ${selectedDocIds.has(doc.id) ? 'ring-2 ring-primary border-primary bg-primary/5' : ''}`}
+                  >
+                    {isMultiSelectMode && (
+                      <div className="absolute top-4 left-4 z-10">
+                        <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center transition-all ${selectedDocIds.has(doc.id) ? 'bg-primary border-primary text-white' : 'bg-white border-slate-300'}`}>
+                          {selectedDocIds.has(doc.id) && <CheckCircle2 size={14} />}
+                        </div>
+                      </div>
+                    )}
+                    <div className="flex justify-between items-start mb-4">
                       <div className="p-3 bg-slate-50 rounded-xl text-slate-400 group-hover:bg-primary/5 group-hover:text-primary transition-colors">
                         <FileText size={28} />
                       </div>
@@ -1197,6 +1264,36 @@ function App() {
                     </div>
                   </div>
                 ))}
+              </div>
+            )}
+
+            {isMultiSelectMode && selectedDocIds.size > 0 && (
+              <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-40 flex items-center gap-4 p-4 bg-slate-900 text-white rounded-3xl shadow-2xl animate-in fade-in slide-in-from-bottom-8 duration-300 border border-white/10 backdrop-blur-md">
+                <span className="font-semibold text-sm pl-2">{selectedDocIds.size} 個文件已選取</span>
+                <div className="h-6 w-px bg-white/20 mx-2"></div>
+                <button
+                  onClick={() => setIsBatchTagModalOpen(true)}
+                  className="flex items-center gap-2 px-4 py-2 hover:bg-white/10 rounded-xl transition-colors text-sm font-bold"
+                >
+                  <BookMarked size={18} className="text-primary" />
+                  <span>批次分類</span>
+                </button>
+                <button
+                  onClick={handleBatchDelete}
+                  className="flex items-center gap-2 px-4 py-2 hover:bg-red-500/20 text-red-400 rounded-xl transition-colors text-sm font-bold"
+                >
+                  <Trash2 size={18} />
+                  <span>批次刪除</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setIsMultiSelectMode(false);
+                    setSelectedDocIds(new Set());
+                  }}
+                  className="p-2 hover:bg-white/10 rounded-lg transition-colors"
+                >
+                  <X size={18} />
+                </button>
               </div>
             )}
           </div>
@@ -1782,6 +1879,53 @@ function App() {
             >
               確定
             </button>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Tag Update Modal */}
+      {isBatchTagModalOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+          <div
+            className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-300"
+            onClick={() => setIsBatchTagModalOpen(false)}
+          />
+          <div className="relative bg-white rounded-4xl p-8 max-w-sm w-full shadow-2xl border border-slate-100 flex flex-col items-center text-center gap-6 animate-in zoom-in-95 duration-200">
+            <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center text-primary">
+              <BookMarked size={32} />
+            </div>
+            <div>
+              <h3 className="text-xl font-bold text-slate-900">批次修改分類</h3>
+              <p className="text-slate-500 mt-2 text-sm">將選取的 {selectedDocIds.size} 份文件變更至以下分類：</p>
+            </div>
+
+            <select
+              className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-6 py-4 text-sm focus:outline-none focus:border-primary/40 focus:bg-white transition-all appearance-none"
+              value={batchTagId}
+              onChange={(e) => setBatchTagId(e.target.value)}
+              style={{ background: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' fill=\'none\' viewBox=\'0 0 24 24\' stroke=\'%236366f1\'%3E%3Cpath stroke-linecap=\'round\' stroke-linejoin=\'round\' stroke-width=\'2\' d=\'M19 9l-7 7-7-7\' /%3E%3C/svg%3E") no-repeat right 1.5rem center / 1.2rem' }}
+            >
+              <option value="">選擇標籤 (未分類)</option>
+              {tags.map(tag => (
+                <option key={tag.id} value={tag.id}>{tag.name}</option>
+              ))}
+            </select>
+
+            <div className="flex gap-3 w-full">
+              <button
+                onClick={() => setIsBatchTagModalOpen(false)}
+                className="flex-1 px-6 py-4 bg-slate-100 text-slate-600 rounded-2xl font-bold hover:bg-slate-200 transition-all font-bold"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleBatchTagUpdate}
+                disabled={!batchTagId}
+                className="flex-1 px-6 py-4 bg-primary text-white rounded-2xl font-bold hover:bg-primary/90 shadow-lg shadow-primary/20 transition-all disabled:opacity-50"
+              >
+                確認修改
+              </button>
+            </div>
           </div>
         </div>
       )}

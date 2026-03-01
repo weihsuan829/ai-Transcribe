@@ -91,6 +91,17 @@ try {
     db.exec("ALTER TABLE documents ADD COLUMN tag_id INTEGER REFERENCES tags(id) ON DELETE SET NULL");
 } catch (e) { }
 
+// Migration: Create document_chunks table for advanced chunked RAG
+db.exec(`
+    CREATE TABLE IF NOT EXISTS document_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        document_id INTEGER REFERENCES documents(id) ON DELETE CASCADE,
+        content TEXT,
+        embedding TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+`);
+
 const app = express();
 const port = process.env.PORT || 3001;
 const execPromise = promisify(exec);
@@ -678,22 +689,36 @@ app.post('/api/chat', async (req, res) => {
 
         // 4. Fetch all sources with embeddings
         let transcriptQuery = "SELECT id, url as source_url, transcript as content, embedding, 'reel' as type, created_at FROM saved_transcripts WHERE embedding IS NOT NULL";
-        let docQuery = "SELECT id, name, filename, content, embedding, 'doc' as type, created_at FROM documents WHERE embedding IS NOT NULL";
+        // New: Query document_chunks for better precision
+        let docChunkQuery = `
+            SELECT 
+                dc.id as chunk_id, 
+                d.id as doc_id, 
+                d.name, 
+                d.filename,
+                dc.content, 
+                dc.embedding, 
+                'doc' as type, 
+                d.created_at 
+            FROM document_chunks dc
+            JOIN documents d ON dc.document_id = d.id
+            WHERE dc.embedding IS NOT NULL
+        `;
 
-        let transcripts, documents;
+        let transcripts, docChunks;
 
         if (tag_id) {
             transcriptQuery += " AND tag_id = ?";
             transcripts = db.prepare(transcriptQuery).all(tag_id);
 
-            docQuery += " AND tag_id = ?";
-            documents = db.prepare(docQuery).all(tag_id);
+            docChunkQuery += " AND d.tag_id = ?";
+            docChunks = db.prepare(docChunkQuery).all(tag_id);
         } else {
             transcripts = db.prepare(transcriptQuery).all();
-            documents = db.prepare(docQuery).all();
+            docChunks = db.prepare(docChunkQuery).all();
         }
 
-        const allSources = [...transcripts, ...documents];
+        const allSources = [...transcripts, ...docChunks];
 
         // 5. Calculate similarity and rank
         const rankedResults = allSources.map(source => {
@@ -704,7 +729,7 @@ app.post('/api/chat', async (req, res) => {
                     similarity: cosineSimilarity(queryVector, sourceVector)
                 };
             } catch (parseError) {
-                console.error(`Error parsing embedding for source ${source.id}:`, parseError);
+                console.error(`Error parsing embedding for source ${source.id || source.chunk_id}:`, parseError);
                 return { ...source, similarity: 0 };
             }
         }).sort((a, b) => b.similarity - a.similarity).slice(0, 10);
@@ -758,13 +783,20 @@ ${context}`;
         const gptCost = calculateCost(model === 'gemini' ? 'gemini-flash-latest' : 'gpt-4o-mini', chatUsage);
         const embeddingCost = (queryVector.length * 4) / 1000000 * PRICING['text-embedding-3-small'].input; // Rough estimate for embedding cost
 
-        const sourcesData = rankedResults.map(r => ({
-            id: r.id,
-            url: r.type === 'reel' ? r.source_url : `http://localhost:3001/uploads/${r.filename}`,
-            name: r.type === 'reel' ? 'Reel 原文' : r.name,
-            type: r.type
-        }));
-        const sources = JSON.stringify(sourcesData);
+        const uniqueSourcesMap = new Map();
+        rankedResults.forEach(r => {
+            const uniqueKey = r.type === 'reel' ? `reel-${r.id}` : `doc-${r.doc_id}`;
+            if (!uniqueSourcesMap.has(uniqueKey)) {
+                uniqueSourcesMap.set(uniqueKey, {
+                    id: r.type === 'reel' ? r.id : r.doc_id,
+                    url: r.type === 'reel' ? r.source_url : `http://localhost:3001/uploads/${r.filename}`,
+                    name: r.type === 'reel' ? 'Reel 原文' : r.name,
+                    type: r.type
+                });
+            }
+        });
+        const uniqueSourcesArray = Array.from(uniqueSourcesMap.values());
+        const sources = JSON.stringify(uniqueSourcesArray);
 
         // 10. Save User and AI messages to history
         db.prepare('INSERT INTO chat_messages (thread_id, role, content) VALUES (?, ?, ?)').run(thread_id, 'user', message);
@@ -773,12 +805,7 @@ ${context}`;
         res.json({
             thread_id,
             answer: answerText,
-            sources: rankedResults.map(r => ({
-                id: r.id,
-                url: r.type === 'reel' ? r.source_url : `http://localhost:3001/uploads/${r.filename}`,
-                name: r.type === 'reel' ? 'Reel 原文' : r.name,
-                type: r.type
-            })),
+            sources: uniqueSourcesArray,
             usage: chatUsage,
             cost: (gptCost + embeddingCost).toFixed(6)
         });
@@ -847,6 +874,7 @@ app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
     }
 
     try {
+        const { tag_id } = req.body || {};
         let textContent = '';
         const filePath = req.file.path;
 
@@ -879,42 +907,60 @@ app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
 
         console.log(`Extracted text length: ${textContent.length} characters`);
 
-        // Generate embedding for the document content
-        try {
-            console.log('Requesting OpenAI embedding...');
-            const embeddingRes = await openai.embeddings.create({
-                model: "text-embedding-3-small",
-                input: textContent.substring(0, 2000), // Reduced to safe limit (Chinese chars ~2 tokens)
-            });
-            console.log('Embedding received successfully');
-            const embedding = JSON.stringify(embeddingRes.data[0].embedding);
+        // 1. Save main document metadata
+        const originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
+        const docResult = db.prepare('INSERT INTO documents (name, filename, type, content, tag_id) VALUES (?, ?, ?, ?, ?)').run(
+            originalName,
+            req.file.filename,
+            req.file.mimetype,
+            textContent,
+            tag_id || null
+        );
+        const documentId = docResult.lastInsertRowid;
 
-            console.log('Saving document to database...');
-            const originalName = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
-            const result = db.prepare('INSERT INTO documents (name, filename, type, content, embedding, tag_id) VALUES (?, ?, ?, ?, ?, ?)').run(
-                originalName,
-                req.file.filename,
-                req.file.mimetype,
-                textContent,
-                embedding,
-                tag_id || null
-            );
-            console.log(`Document saved with ID: ${result.lastInsertRowid}`);
+        // 2. Chunking Logic (600 characters with 100 character overlap)
+        const chunkSize = 600;
+        const overlap = 100;
+        const chunks = [];
 
-            res.json({
-                id: result.lastInsertRowid,
-                name: originalName,
-                filename: req.file.filename,
-                type: req.file.mimetype
-            });
-        } catch (aiError) {
-            console.error('Detailed AI/DB Error:', aiError);
-            res.status(500).json({ error: `處理失敗: ${aiError.message}` });
+        for (let i = 0; i < textContent.length; i += (chunkSize - overlap)) {
+            const chunk = textContent.substring(i, i + chunkSize);
+            if (chunk.trim()) chunks.push(chunk);
+            if (i + chunkSize >= textContent.length) break;
         }
+
+        console.log(`Split document into ${chunks.length} chunks`);
+
+        // 3. Generate Embeddings & Save Chunks
+        for (const [index, chunkText] of chunks.entries()) {
+            try {
+                console.log(`Processing chunk ${index + 1}/${chunks.length}...`);
+                const embeddingRes = await openai.embeddings.create({
+                    model: "text-embedding-3-small",
+                    input: chunkText,
+                });
+                const embedding = JSON.stringify(embeddingRes.data[0].embedding);
+
+                db.prepare('INSERT INTO document_chunks (document_id, content, embedding) VALUES (?, ?, ?)').run(
+                    documentId,
+                    chunkText,
+                    embedding
+                );
+            } catch (chunkErr) {
+                console.error(`Error processing chunk ${index}:`, chunkErr);
+                // Continue with other chunks if one fails
+            }
+        }
+
+        res.json({
+            id: documentId,
+            message: '文件上傳並切割處理完成',
+            chunks: chunks.length
+        });
     } catch (error) {
         console.error('General Upload Error:', error);
         if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        res.status(500).json({ error: '伺服器發生錯誤，無法處理您的文件。' });
+        res.status(500).json({ error: '檔案處理失敗' });
     }
 });
 
@@ -966,6 +1012,42 @@ app.delete('/api/documents/:id', (req, res) => {
             stack: error.stack
         });
         res.status(500).json({ error: `刪除文件時發生錯誤: ${error.message}` });
+    }
+});
+
+// Batch Operations
+app.post('/api/documents/batch-delete', (req, res) => {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ error: 'Invalid document IDs' });
+    }
+    try {
+        const placeholders = ids.map(() => '?').join(',');
+        const docs = db.prepare(`SELECT filename FROM documents WHERE id IN (${placeholders})`).all(...ids);
+        docs.forEach(doc => {
+            const filePath = path.join(__dirname, 'uploads', doc.filename);
+            if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        });
+        db.prepare(`DELETE FROM documents WHERE id IN (${placeholders})`).run(...ids);
+        res.json({ success: true, count: ids.length });
+    } catch (error) {
+        console.error('Batch delete error:', error);
+        res.status(500).json({ error: 'Failed to batch delete documents' });
+    }
+});
+
+app.post('/api/documents/batch-tag', (req, res) => {
+    const { ids, tag_id } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+        return res.status(400).json({ error: 'Invalid document IDs' });
+    }
+    try {
+        const placeholders = ids.map(() => '?').join(',');
+        db.prepare(`UPDATE documents SET tag_id = ? WHERE id IN (${placeholders})`).run(tag_id || null, ...ids);
+        res.json({ success: true, count: ids.length });
+    } catch (error) {
+        console.error('Batch tag error:', error);
+        res.status(500).json({ error: 'Failed to batch update tags' });
     }
 });
 

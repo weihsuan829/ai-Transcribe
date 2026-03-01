@@ -146,6 +146,24 @@ export const updateDocumentTag = async (id, tagId) => {
     }
 };
 
+export const batchDeleteDocuments = async (ids) => {
+    try {
+        const response = await axios.post(`${API_BASE_URL}/documents/batch-delete`, { ids });
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to batch delete documents');
+    }
+};
+
+export const batchUpdateDocumentTags = async (ids, tagId) => {
+    try {
+        const response = await axios.post(`${API_BASE_URL}/documents/batch-tag`, { ids, tag_id: tagId });
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to batch update document tags');
+    }
+};
+
 export const deleteDocument = async (id) => {
     try {
         const response = await axios.delete(`${API_BASE_URL}/documents/${id}`);
