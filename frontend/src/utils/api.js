@@ -64,13 +64,15 @@ export const deleteFromHistory = async (id) => {
     }
 };
 
-export const sendChatMessage = async (message, threadId = null, model = 'openai', tagId = null) => {
+export const sendChatMessage = async (message, threadId = null, model = 'openai', tagId = null, filterCategoryIds = [], filterTagIds = []) => {
     try {
         const response = await axios.post(`${API_BASE_URL}/chat`, {
             message,
             thread_id: threadId,
             model,
-            tag_id: tagId
+            tag_id: tagId,
+            filter_category_ids: filterCategoryIds,
+            filter_tag_ids: filterTagIds
         });
         return response.data;
     } catch (error) {
@@ -102,6 +104,15 @@ export const deleteThread = async (threadId) => {
         return response.data;
     } catch (error) {
         throw new Error('Failed to delete thread');
+    }
+};
+
+export const renameThread = async (threadId, title) => {
+    try {
+        const response = await axios.patch(`${API_BASE_URL}/chat/threads/${threadId}`, { title });
+        return response.data;
+    } catch (error) {
+        throw new Error(error.response?.data?.error || 'Failed to rename thread');
     }
 };
 
@@ -174,6 +185,34 @@ export const deleteDocument = async (id) => {
     }
 };
 
+// Category Management
+export const getCategories = async () => {
+    try {
+        const response = await axios.get(`${API_BASE_URL}/categories`);
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to fetch categories');
+    }
+};
+
+export const createCategory = async (name) => {
+    try {
+        const response = await axios.post(`${API_BASE_URL}/categories`, { name });
+        return response.data;
+    } catch (error) {
+        throw new Error(error.response?.data?.error || 'Failed to create category');
+    }
+};
+
+export const deleteCategory = async (id) => {
+    try {
+        const response = await axios.delete(`${API_BASE_URL}/categories/${id}`);
+        return response.data;
+    } catch (error) {
+        throw new Error('Failed to delete category');
+    }
+};
+
 // Tag Management
 export const getTags = async () => {
     try {
@@ -184,9 +223,9 @@ export const getTags = async () => {
     }
 };
 
-export const createTag = async (name) => {
+export const createTag = async (name, category_id = null) => {
     try {
-        const response = await axios.post(`${API_BASE_URL}/tags`, { name });
+        const response = await axios.post(`${API_BASE_URL}/tags`, { name, category_id });
         return response.data;
     } catch (error) {
         throw new Error(error.response?.data?.error || 'Failed to create tag');

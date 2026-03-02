@@ -26,7 +26,10 @@ import {
   Music,
   Film,
   Mic,
-  Coins
+  Coins,
+  Folder,
+  Hash,
+  Edit2
 } from 'lucide-react';
 import {
   transcribeUrl,
@@ -45,11 +48,14 @@ import {
   updateDocumentTag,
   deleteDocument,
   getTags,
-  createTag,
   deleteTag,
+  getCategories,
+  createCategory,
+  deleteCategory,
   processMeeting,
   batchDeleteDocuments,
-  batchUpdateDocumentTags
+  batchUpdateDocumentTags,
+  renameThread
 } from './utils/api';
 
 const BentoCard = ({ children, title, icon: Icon, className = "" }) => (
@@ -126,10 +132,33 @@ function App() {
   const [showLibDeleteConfirm, setShowLibDeleteConfirm] = useState(false);
   const [libItemToDelete, setLibItemToDelete] = useState(null);
 
+  // Rename Thread states
+  const [editingThreadId, setEditingThreadId] = useState(null);
+  const [editingTitle, setEditingTitle] = useState('');
+
+  // Category states
+  const [categories, setCategories] = useState([]);
+  const [newCategoryName, setNewCategoryName] = useState('');
+
   // Tag states
   const [tags, setTags] = useState([]);
-  const [chatFilterTagId, setChatFilterTagId] = useState('');
+  const [chatFilterCategoryIds, setChatFilterCategoryIds] = useState([]);
+  const [chatFilterTagIds, setChatFilterTagIds] = useState([]);
+
+  const toggleCategoryFilter = (id) => {
+    setChatFilterCategoryIds(prev =>
+      prev.includes(id) ? prev.filter(cId => cId !== id) : [...prev, id]
+    );
+  };
+
+  const toggleTagFilter = (id) => {
+    setChatFilterTagIds(prev =>
+      prev.includes(id) ? prev.filter(tId => tId !== id) : [...prev, id]
+    );
+  };
+
   const [newTagName, setNewTagName] = useState('');
+  const [selectedCategoryIdForNewTag, setSelectedCategoryIdForNewTag] = useState('');
   const [isTagLoading, setIsTagLoading] = useState(false);
 
   // Meeting states
@@ -158,6 +187,7 @@ function App() {
   const currentTabState = tabStates[view] || { result: null, isLoading: false, error: null, saveStatus: null, selectedTagId: '' };
 
   useEffect(() => {
+    fetchCategories();
     fetchTags(); // Fetch tags on mount to have them ready
     if (view === 'library') {
       fetchHistory();
@@ -345,6 +375,15 @@ function App() {
     }
   };
 
+  const fetchCategories = async () => {
+    try {
+      const data = await getCategories();
+      setCategories(data);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   const fetchTags = async () => {
     try {
       const data = await getTags();
@@ -415,12 +454,60 @@ function App() {
     return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  const handleCreateCategory = async (e) => {
+    e.preventDefault();
+    if (!newCategoryName.trim()) return;
+    try {
+      await createCategory(newCategoryName);
+      setNewCategoryName('');
+      fetchCategories();
+    } catch (err) {
+      setErrorMessage(err.message);
+    }
+  };
+
+  const handleDeleteCategory = async (id) => {
+    if (!window.confirm('確定要刪除此領域嗎？底下所有的標籤也會一併被移除。')) return;
+    try {
+      await deleteCategory(id);
+      fetchCategories();
+      fetchTags(); // Tags might be deleted by cascade
+    } catch (err) {
+      setErrorMessage('刪除失敗');
+    }
+  };
+
+  const renderTagGroups = () => {
+    return (
+      <>
+        {categories.map(cat => {
+          const catTags = tags.filter(t => t.category_id === cat.id);
+          if (catTags.length === 0) return null;
+          return (
+            <optgroup key={cat.id} label={cat.name}>
+              {catTags.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </optgroup>
+          );
+        })}
+        {tags.filter(t => !t.category_id).length > 0 && (
+          <optgroup label="未分類">
+            {tags.filter(t => !t.category_id).map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+          </optgroup>
+        )}
+      </>
+    );
+  };
+
   const handleCreateTag = async (e) => {
     e.preventDefault();
     if (!newTagName.trim() || isTagLoading) return;
+    if (!selectedCategoryIdForNewTag) {
+      setErrorMessage('請先選擇一個領域');
+      return;
+    }
     setIsTagLoading(true);
     try {
-      await createTag(newTagName);
+      await createTag(newTagName, selectedCategoryIdForNewTag);
       setNewTagName('');
       fetchTags();
     } catch (err) {
@@ -451,7 +538,7 @@ function App() {
     setIsChatLoading(true);
 
     try {
-      const response = await sendChatMessage(messageToSend, currentThreadId, modelProvider, chatFilterTagId || null);
+      const response = await sendChatMessage(messageToSend, currentThreadId, modelProvider, null, chatFilterCategoryIds, chatFilterTagIds);
       const aiMsg = {
         role: 'assistant',
         content: response.answer,
@@ -596,7 +683,7 @@ function App() {
             <div className="w-9 h-9 bg-primary rounded-xl flex items-center justify-center text-white shadow-lg shadow-primary/20">
               <Instagram size={22} />
             </div>
-            <span className="text-lg font-bold tracking-tight text-slate-800 whitespace-nowrap">影音轉文字助手</span>
+            <span className="text-lg font-bold tracking-tight text-slate-800 whitespace-nowrap">影音轉文字工具</span>
           </div>
           <div className="flex bg-slate-100 p-1.5 rounded-2xl">
             {/* Model Selector */}
@@ -817,9 +904,7 @@ function App() {
                           onChange={(e) => updateTabState('home', { selectedTagId: e.target.value })}
                         >
                           <option value="">選擇分類標籤 (可不選)</option>
-                          {tags.map(tag => (
-                            <option key={tag.id} value={tag.id}>{tag.name}</option>
-                          ))}
+                          {renderTagGroups()}
                         </select>
                         <button
                           onClick={handleSave}
@@ -921,9 +1006,7 @@ function App() {
                                 onClick={(e) => e.stopPropagation()}
                               >
                                 <option value="">未分類</option>
-                                {tags.map(t => (
-                                  <option key={t.id} value={t.id}>{t.name}</option>
-                                ))}
+                                {renderTagGroups()}
                               </select>
                             </div>
                             <a
@@ -1110,9 +1193,7 @@ function App() {
                         style={{ background: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' fill=\'none\' viewBox=\'0 0 24 24\' stroke=\'%236366f1\'%3E%3Cpath stroke-linecap=\'round\' stroke-linejoin=\'round\' stroke-width=\'2\' d=\'M19 9l-7 7-7-7\' /%3E%3C/svg%3E") no-repeat right 1.5rem center / 1.2rem' }}
                       >
                         <option value="">選擇分類標籤 (可不選)</option>
-                        {tags.map(tag => (
-                          <option key={tag.id} value={tag.id}>{tag.name}</option>
-                        ))}
+                        {renderTagGroups()}
                       </select>
                       <button
                         onClick={handleSave}
@@ -1143,9 +1224,7 @@ function App() {
                   onChange={(e) => setSelectedDocTagId(e.target.value)}
                 >
                   <option value="">選擇分類標籤</option>
-                  {tags.map(tag => (
-                    <option key={tag.id} value={tag.id}>{tag.name}</option>
-                  ))}
+                  {renderTagGroups()}
                 </select>
                 <label htmlFor="doc-upload" className="cursor-pointer">
                   <div className={`btn-primary flex items-center gap-2 px-6 py-3 rounded-2xl ${docUploadStatus === 'uploading' ? 'opacity-50 cursor-not-allowed' : ''}`}>
@@ -1254,9 +1333,7 @@ function App() {
                           onChange={(e) => handleDocTagChange(doc.id, e.target.value)}
                         >
                           <option value="">未分類</option>
-                          {tags.map(t => (
-                            <option key={t.id} value={t.id}>{t.name}</option>
-                          ))}
+                          {renderTagGroups()}
                         </select>
                         <span>•</span>
                         <span>{new Date(doc.created_at).toLocaleDateString()}</span>
@@ -1298,54 +1375,117 @@ function App() {
             )}
           </div>
         ) : view === 'tags' ? (
-          /* Tag Management View */
-          <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+          /* Category & Tag Management View */
+          <div className="space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <header className="text-left space-y-2">
-              <h1 className="text-3xl font-bold text-slate-900">分類標籤管理</h1>
-              <p className="text-text-muted mt-1">建立自定義標籤（如頻道名稱），以便在問答時進行精確過濾。</p>
+              <h1 className="text-3xl font-bold text-slate-900">領域與標籤管理</h1>
+              <p className="text-text-muted mt-1">建立高階領域（如：股票）以及所屬分類標籤（如：老王），以便在問答時進行精確過濾。</p>
             </header>
 
-            <form onSubmit={handleCreateTag} className="flex gap-4 max-w-md">
-              <input
-                type="text"
-                placeholder="輸入新標籤名稱 (例如: 老王不只三分鐘)..."
-                className="w-full bg-white border border-slate-200 rounded-2xl py-3 px-6 focus:outline-none focus:border-primary/40 focus:bg-white transition-all shadow-sm text-slate-700"
-                value={newTagName}
-                onChange={(e) => setNewTagName(e.target.value)}
-                disabled={isTagLoading}
-              />
-              <button
-                type="submit"
-                className="btn-primary flex items-center gap-2 px-8 whitespace-nowrap"
-                disabled={isTagLoading || !newTagName.trim()}
-              >
-                {isTagLoading ? <Loader2 className="animate-spin" size={18} /> : <Search size={18} />}
-                <span>新增</span>
-              </button>
-            </form>
+            <div className="space-y-6">
+              <h2 className="text-xl font-bold text-slate-800 border-b border-slate-200 pb-2">1. 領域管理 (Domains)</h2>
+              <form onSubmit={handleCreateCategory} className="flex gap-4 max-w-md">
+                <input
+                  type="text"
+                  placeholder="輸入新領域名稱 (例如: 股票)..."
+                  className="w-full bg-slate-50 border border-slate-200 rounded-2xl py-3 px-6 focus:outline-none focus:border-primary/40 focus:bg-white transition-all shadow-sm text-slate-700"
+                  value={newCategoryName}
+                  onChange={(e) => setNewCategoryName(e.target.value)}
+                />
+                <button
+                  type="submit"
+                  className="btn-primary flex items-center gap-2 px-6 whitespace-nowrap"
+                  disabled={!newCategoryName.trim()}
+                >
+                  <Folder size={18} />
+                  <span>新增領域</span>
+                </button>
+              </form>
 
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {tags.map(tag => (
-                <div key={tag.id} className="bento-card bg-white flex items-center justify-between group p-6 rounded-3xl border border-slate-100 shadow-soft">
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 bg-slate-50 text-slate-400 rounded-lg group-hover:bg-primary/10 group-hover:text-primary transition-colors">
-                      <Search size={16} />
-                    </div>
-                    <span className="font-semibold text-slate-700">{tag.name}</span>
+              <div className="flex flex-wrap gap-4 pt-2">
+                {categories.map(cat => (
+                  <div key={cat.id} className="flex items-center gap-2 bg-indigo-50 border border-indigo-100 text-indigo-700 px-4 py-2 rounded-xl shadow-sm text-sm font-semibold group">
+                    <Folder size={16} className="text-indigo-400 group-hover:text-indigo-600 transition-colors" />
+                    {cat.name}
+                    <button
+                      onClick={() => handleDeleteCategory(cat.id)}
+                      className="ml-2 text-indigo-300 hover:text-red-500 hover:bg-red-50 p-1 rounded-md transition-all"
+                    >
+                      <X size={14} strokeWidth={3} />
+                    </button>
                   </div>
-                  <button
-                    onClick={() => handleDeleteTag(tag.id)}
-                    className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
-                  >
-                    <Trash2 size={16} />
-                  </button>
-                </div>
-              ))}
-              {tags.length === 0 && (
-                <div className="col-span-3 py-12 text-center bg-white rounded-3xl border border-dashed border-slate-200">
-                  <p className="text-slate-400 italic">尚未建立任何標籤</p>
-                </div>
-              )}
+                ))}
+                {categories.length === 0 && (
+                  <div className="text-slate-400 italic text-sm py-2">尚未建立任何領域</div>
+                )}
+              </div>
+            </div>
+
+            <div className="space-y-6 pt-4">
+              <h2 className="text-xl font-bold text-slate-800 border-b border-slate-200 pb-2">2. 項目標籤管理 (Tags)</h2>
+              <form onSubmit={handleCreateTag} className="flex flex-col md:flex-row gap-4 max-w-2xl">
+                <select
+                  className="bg-slate-50 border border-slate-200 rounded-2xl py-3 px-4 focus:outline-none focus:border-primary/40 focus:bg-white text-slate-700 font-medium md:max-w-xs cursor-pointer shadow-sm"
+                  value={selectedCategoryIdForNewTag}
+                  onChange={(e) => setSelectedCategoryIdForNewTag(e.target.value)}
+                >
+                  <option value="">-- 選擇所屬領域 --</option>
+                  {categories.map(c => (
+                    <option key={c.id} value={c.id}>{c.name}</option>
+                  ))}
+                </select>
+                <input
+                  type="text"
+                  placeholder="輸入新標籤名稱 (例如: 老王不只三分鐘)..."
+                  className="flex-1 bg-slate-50 border border-slate-200 rounded-2xl py-3 px-6 focus:outline-none focus:border-primary/40 focus:bg-white transition-all shadow-sm text-slate-700"
+                  value={newTagName}
+                  onChange={(e) => setNewTagName(e.target.value)}
+                  disabled={isTagLoading}
+                />
+                <button
+                  type="submit"
+                  className="btn-primary flex items-center gap-2 px-8 whitespace-nowrap"
+                  disabled={isTagLoading || !newTagName.trim() || !selectedCategoryIdForNewTag}
+                >
+                  {isTagLoading ? <Loader2 className="animate-spin" size={18} /> : <Hash size={18} />}
+                  <span>新增標籤</span>
+                </button>
+              </form>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6 pt-2">
+                {tags.map(tag => (
+                  <div key={tag.id} className="bento-card bg-white flex flex-col justify-center group p-6 rounded-3xl border border-slate-100 shadow-soft relative overflow-hidden">
+                    <div className="absolute top-0 left-0 w-1 h-full bg-primary/20 group-hover:bg-primary transition-colors"></div>
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-3">
+                        <div className="p-2 bg-slate-50 text-slate-400 rounded-lg group-hover:bg-primary/10 group-hover:text-primary transition-colors">
+                          <Hash size={18} />
+                        </div>
+                        <span className="font-bold text-lg text-slate-700">{tag.name}</span>
+                      </div>
+                      <button
+                        onClick={() => handleDeleteTag(tag.id)}
+                        className="p-2 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
+                    <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-slate-100 text-slate-500 w-fit">
+                      <Folder size={12} className="text-slate-400" />
+                      {tag.category_name || '未分類'}
+                    </div>
+                  </div>
+                ))}
+                {tags.length === 0 && (
+                  <div className="col-span-3 py-16 text-center bg-white rounded-3xl border border-dashed border-slate-200">
+                    <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-slate-50 mb-4">
+                      <Hash size={24} className="text-slate-300" />
+                    </div>
+                    <p className="text-slate-500 font-medium">尚未建立任何標籤項目</p>
+                    <p className="text-slate-400 text-sm mt-1">請先選擇領域後新增您的第一個標籤</p>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         ) : view === 'meeting' ? (
@@ -1467,9 +1607,7 @@ function App() {
                       onChange={(e) => updateTabState('meeting', { selectedTagId: e.target.value })}
                     >
                       <option value="">選擇分類標籤 (如：會議紀錄)</option>
-                      {tags.map(tag => (
-                        <option key={tag.id} value={tag.id}>{tag.name}</option>
-                      ))}
+                      {renderTagGroups()}
                     </select>
                     <button
                       onClick={handleSave}
@@ -1503,20 +1641,75 @@ function App() {
                 {threads.map(thread => (
                   <div
                     key={thread.id}
-                    onClick={() => loadThreadMessages(thread.id)}
+                    onClick={() => {
+                      if (editingThreadId !== thread.id) {
+                        loadThreadMessages(thread.id);
+                      }
+                    }}
                     className={`group p-3 rounded-xl cursor-pointer flex items-center justify-between transition-all ${currentThreadId === thread.id ? 'bg-primary text-white shadow-md' : 'hover:bg-white text-slate-600'}`}
                   >
-                    <div className="flex items-center gap-2 overflow-hidden">
+                    <div className="flex items-center gap-2 overflow-hidden flex-1">
                       <FileText size={14} className={currentThreadId === thread.id ? 'text-white/70' : 'text-slate-400'} />
-                      <span className="text-sm font-medium truncate">{thread.title}</span>
+                      {editingThreadId === thread.id ? (
+                        <input
+                          autoFocus
+                          value={editingTitle}
+                          onChange={(e) => setEditingTitle(e.target.value)}
+                          onBlur={async () => {
+                            if (editingTitle.trim() && editingTitle.trim() !== thread.title) {
+                              try {
+                                await renameThread(thread.id, editingTitle.trim());
+                                fetchThreads();
+                              } catch (err) {
+                                setErrorMessage('修改名稱失敗');
+                              }
+                            }
+                            setEditingThreadId(null);
+                          }}
+                          onKeyDown={async (e) => {
+                            if (e.key === 'Enter') {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              e.target.blur();
+                            } else if (e.key === 'Escape') {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              setEditingThreadId(null);
+                            }
+                          }}
+                          className={`text-sm font-medium flex-1 bg-white/20 px-1 py-0.5 rounded outline-none w-full ${currentThreadId === thread.id ? 'text-white placeholder-white/50' : 'text-slate-800 placeholder-slate-400'}`}
+                          onClick={(e) => e.stopPropagation()}
+                          title="修改對話名稱"
+                        />
+                      ) : (
+                        <span className="text-sm font-medium truncate flex-1" title={thread.title}>
+                          {thread.title}
+                        </span>
+                      )}
                     </div>
-                    <button
-                      onClick={(e) => handleThreadDelete(e, thread.id)}
-                      className={`p-2 opacity-0 group-hover:opacity-100 hover:bg-red-500 hover:text-white rounded-lg transition-all relative z-10 ${currentThreadId === thread.id ? 'hover:bg-white/20' : ''}`}
-                      title="刪除對話"
-                    >
-                      <Trash2 size={16} />
-                    </button>
+
+                    <div className="flex opacity-0 group-hover:opacity-100 transition-opacity">
+                      {editingThreadId !== thread.id && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setEditingTitle(thread.title);
+                            setEditingThreadId(thread.id);
+                          }}
+                          className={`p-1.5 hover:bg-white/20 rounded-lg transition-all z-10 mr-1 ${currentThreadId === thread.id ? 'text-white' : 'text-slate-500 hover:text-slate-800'}`}
+                          title="修改名稱"
+                        >
+                          <Edit2 size={14} />
+                        </button>
+                      )}
+                      <button
+                        onClick={(e) => handleThreadDelete(e, thread.id)}
+                        className={`p-1.5 hover:bg-red-500 hover:text-white rounded-lg transition-all z-10 ${currentThreadId === thread.id ? 'text-white hover:bg-red-500/80' : 'text-slate-500'}`}
+                        title="刪除對話"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    </div>
                   </div>
                 ))}
                 {threads.length === 0 && (
@@ -1552,22 +1745,7 @@ function App() {
                       <span>RAG 模式：已連接歷史資料庫</span>
                     </div>
                   </div>
-                  {/* Tag Filter Dropdown */}
-                  {!currentThreadId && (
-                    <div className="flex items-center gap-2">
-                      <span className="text-xs text-slate-400 font-bold">過濾來源:</span>
-                      <select
-                        className="bg-white border border-border rounded-lg px-2 py-1 text-xs focus:outline-none focus:border-primary/40 shadow-sm"
-                        value={chatFilterTagId}
-                        onChange={(e) => setChatFilterTagId(e.target.value)}
-                      >
-                        <option value="">全部來源</option>
-                        {tags.map(tag => (
-                          <option key={tag.id} value={tag.id}>{tag.name}</option>
-                        ))}
-                      </select>
-                    </div>
-                  )}
+                  {/* Multi-select filter is now above the chat input */}
                 </div>
               </div>
 
@@ -1645,6 +1823,36 @@ function App() {
 
               {/* Chat Input */}
               <div className="p-6 bg-white border-t border-slate-50">
+                {!currentThreadId && (
+                  <div className="mb-4 bg-slate-50/50 border border-slate-100 p-4 rounded-2xl flex flex-col gap-3 max-w-4xl mx-auto animate-in fade-in slide-in-from-bottom-2">
+                    <span className="text-xs text-slate-500 font-bold flex items-center gap-1.5"><Search size={14} />指定 AI 知識範圍 (不選則搜尋全部)：</span>
+                    <div className="flex flex-wrap gap-2">
+                      {categories.map(cat => (
+                        <button
+                          key={`cat-${cat.id}`}
+                          type="button"
+                          onClick={() => toggleCategoryFilter(cat.id)}
+                          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-bold transition-all ${chatFilterCategoryIds.includes(cat.id) ? 'bg-indigo-500 text-white border-indigo-500 shadow-sm scale-105' : 'bg-white text-slate-500 border-slate-200 hover:border-indigo-300'}`}
+                        >
+                          <Folder size={12} /> {cat.name}
+                        </button>
+                      ))}
+                      {tags.map(tag => (
+                        <button
+                          key={`tag-${tag.id}`}
+                          type="button"
+                          onClick={() => toggleTagFilter(tag.id)}
+                          className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-xs font-bold transition-all ${chatFilterTagIds.includes(tag.id) ? 'bg-slate-700 text-white border-slate-700 shadow-sm scale-105' : 'bg-white text-slate-500 border-slate-200 hover:border-slate-400'}`}
+                        >
+                          <Hash size={12} /> {tag.name}
+                        </button>
+                      ))}
+                      {categories.length === 0 && tags.length === 0 && (
+                        <span className="text-xs text-slate-400 italic">尚未建立任何領域與標籤，請至「分類標籤管理」設定。</span>
+                      )}
+                    </div>
+                  </div>
+                )}
                 <form onSubmit={handleChat} className="relative flex items-center gap-3 max-w-4xl mx-auto w-full">
                   <input
                     type="text"
@@ -1667,8 +1875,9 @@ function App() {
               </div>
             </div>
           </div>
-        )}
-      </div>
+        )
+        }
+      </div >
 
       {/* Preview Modal */}
       {
@@ -1861,74 +2070,76 @@ function App() {
         )
       }
       {/* Error Modal */}
-      {errorMessage && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-          <div
-            className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-300"
-            onClick={() => setErrorMessage(null)}
-          />
-          <div className="relative bg-white rounded-3xl shadow-2xl w-full max-w-sm p-8 animate-in zoom-in-95 duration-200 border border-slate-100">
-            <div className="w-16 h-16 bg-red-50 rounded-2xl flex items-center justify-center mb-6 mx-auto">
-              <AlertCircle className="text-red-500" size={32} />
-            </div>
-            <h3 className="text-xl font-bold text-slate-900 mb-2 text-center">發生錯誤</h3>
-            <p className="text-slate-500 text-center mb-8">{errorMessage}</p>
-            <button
+      {
+        errorMessage && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <div
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-300"
               onClick={() => setErrorMessage(null)}
-              className="w-full bg-slate-900 text-white py-4 rounded-xl font-bold hover:bg-slate-800 transition-colors shadow-lg"
-            >
-              確定
-            </button>
+            />
+            <div className="relative bg-white rounded-3xl shadow-2xl w-full max-w-sm p-8 animate-in zoom-in-95 duration-200 border border-slate-100">
+              <div className="w-16 h-16 bg-red-50 rounded-2xl flex items-center justify-center mb-6 mx-auto">
+                <AlertCircle className="text-red-500" size={32} />
+              </div>
+              <h3 className="text-xl font-bold text-slate-900 mb-2 text-center">發生錯誤</h3>
+              <p className="text-slate-500 text-center mb-8">{errorMessage}</p>
+              <button
+                onClick={() => setErrorMessage(null)}
+                className="w-full bg-slate-900 text-white py-4 rounded-xl font-bold hover:bg-slate-800 transition-colors shadow-lg"
+              >
+                確定
+              </button>
+            </div>
           </div>
-        </div>
-      )}
+        )
+      }
 
       {/* Batch Tag Update Modal */}
-      {isBatchTagModalOpen && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-          <div
-            className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-300"
-            onClick={() => setIsBatchTagModalOpen(false)}
-          />
-          <div className="relative bg-white rounded-4xl p-8 max-w-sm w-full shadow-2xl border border-slate-100 flex flex-col items-center text-center gap-6 animate-in zoom-in-95 duration-200">
-            <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center text-primary">
-              <BookMarked size={32} />
-            </div>
-            <div>
-              <h3 className="text-xl font-bold text-slate-900">批次修改分類</h3>
-              <p className="text-slate-500 mt-2 text-sm">將選取的 {selectedDocIds.size} 份文件變更至以下分類：</p>
-            </div>
+      {
+        isBatchTagModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <div
+              className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm animate-in fade-in duration-300"
+              onClick={() => setIsBatchTagModalOpen(false)}
+            />
+            <div className="relative bg-white rounded-4xl p-8 max-w-sm w-full shadow-2xl border border-slate-100 flex flex-col items-center text-center gap-6 animate-in zoom-in-95 duration-200">
+              <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center text-primary">
+                <BookMarked size={32} />
+              </div>
+              <div>
+                <h3 className="text-xl font-bold text-slate-900">批次修改分類</h3>
+                <p className="text-slate-500 mt-2 text-sm">將選取的 {selectedDocIds.size} 份文件變更至以下分類：</p>
+              </div>
 
-            <select
-              className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-6 py-4 text-sm focus:outline-none focus:border-primary/40 focus:bg-white transition-all appearance-none"
-              value={batchTagId}
-              onChange={(e) => setBatchTagId(e.target.value)}
-              style={{ background: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' fill=\'none\' viewBox=\'0 0 24 24\' stroke=\'%236366f1\'%3E%3Cpath stroke-linecap=\'round\' stroke-linejoin=\'round\' stroke-width=\'2\' d=\'M19 9l-7 7-7-7\' /%3E%3C/svg%3E") no-repeat right 1.5rem center / 1.2rem' }}
-            >
-              <option value="">選擇標籤 (未分類)</option>
-              {tags.map(tag => (
-                <option key={tag.id} value={tag.id}>{tag.name}</option>
-              ))}
-            </select>
+              <select
+                className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-6 py-4 text-sm focus:outline-none focus:border-primary/40 focus:bg-white transition-all appearance-none"
+                value={batchTagId}
+                onChange={(e) => setBatchTagId(e.target.value)}
+                style={{ background: 'url("data:image/svg+xml,%3Csvg xmlns=\'http://www.w3.org/2000/svg\' fill=\'none\' viewBox=\'0 0 24 24\' stroke=\'%236366f1\'%3E%3Cpath stroke-linecap=\'round\' stroke-linejoin=\'round\' stroke-width=\'2\' d=\'M19 9l-7 7-7-7\' /%3E%3C/svg%3E") no-repeat right 1.5rem center / 1.2rem' }}
+              >
+                <option value="">選擇標籤 (未分類)</option>
+                {renderTagGroups()}
+              </select>
 
-            <div className="flex gap-3 w-full">
-              <button
-                onClick={() => setIsBatchTagModalOpen(false)}
-                className="flex-1 px-6 py-4 bg-slate-100 text-slate-600 rounded-2xl font-bold hover:bg-slate-200 transition-all font-bold"
-              >
-                取消
-              </button>
-              <button
-                onClick={handleBatchTagUpdate}
-                disabled={!batchTagId}
-                className="flex-1 px-6 py-4 bg-primary text-white rounded-2xl font-bold hover:bg-primary/90 shadow-lg shadow-primary/20 transition-all disabled:opacity-50"
-              >
-                確認修改
-              </button>
+              <div className="flex gap-3 w-full">
+                <button
+                  onClick={() => setIsBatchTagModalOpen(false)}
+                  className="flex-1 px-6 py-4 bg-slate-100 text-slate-600 rounded-2xl font-bold hover:bg-slate-200 transition-all font-bold"
+                >
+                  取消
+                </button>
+                <button
+                  onClick={handleBatchTagUpdate}
+                  disabled={!batchTagId}
+                  className="flex-1 px-6 py-4 bg-primary text-white rounded-2xl font-bold hover:bg-primary/90 shadow-lg shadow-primary/20 transition-all disabled:opacity-50"
+                >
+                  確認修改
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )
+      }
     </div >
   );
 }

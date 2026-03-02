@@ -64,9 +64,16 @@ db.exec(`
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 
+  CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT UNIQUE NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT UNIQUE NOT NULL,
+    category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
 `);
@@ -89,6 +96,18 @@ try {
 // Migration: Add tag_id to documents
 try {
     db.exec("ALTER TABLE documents ADD COLUMN tag_id INTEGER REFERENCES tags(id) ON DELETE SET NULL");
+} catch (e) { }
+
+// Migration: Create categories table and add category_id to tags
+db.exec(`
+    CREATE TABLE IF NOT EXISTS categories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+`);
+try {
+    db.exec("ALTER TABLE tags ADD COLUMN category_id INTEGER REFERENCES categories(id) ON DELETE CASCADE");
 } catch (e) { }
 
 // Migration: Create document_chunks table for advanced chunked RAG
@@ -569,10 +588,50 @@ app.patch('/api/library/:id/tag', (req, res) => {
     }
 });
 
+// Category Management Endpoints
+app.get('/api/categories', (req, res) => {
+    try {
+        const rows = db.prepare('SELECT * FROM categories ORDER BY name ASC').all();
+        res.json(rows);
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch categories' });
+    }
+});
+
+app.post('/api/categories', (req, res) => {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: 'Category name is required' });
+    try {
+        const info = db.prepare('INSERT INTO categories (name) VALUES (?)').run(name);
+        res.json({ id: info.lastInsertRowid, name });
+    } catch (error) {
+        if (error.code === 'SQLITE_CONSTRAINT') {
+            res.status(400).json({ error: '領域名稱已存在' });
+        } else {
+            res.status(500).json({ error: 'Failed to create category' });
+        }
+    }
+});
+
+app.delete('/api/categories/:id', (req, res) => {
+    const { id } = req.params;
+    try {
+        db.prepare('DELETE FROM categories WHERE id = ?').run(id);
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to delete category' });
+    }
+});
+
 // Tag Management Endpoints
 app.get('/api/tags', (req, res) => {
     try {
-        const rows = db.prepare('SELECT * FROM tags ORDER BY name ASC').all();
+        const rows = db.prepare(`
+            SELECT t.*, c.name as category_name 
+            FROM tags t 
+            LEFT JOIN categories c ON t.category_id = c.id 
+            ORDER BY c.name ASC, t.name ASC
+        `).all();
         res.json(rows);
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch tags' });
@@ -580,11 +639,11 @@ app.get('/api/tags', (req, res) => {
 });
 
 app.post('/api/tags', (req, res) => {
-    const { name } = req.body;
+    const { name, category_id } = req.body;
     if (!name) return res.status(400).json({ error: 'Tag name is required' });
     try {
-        const info = db.prepare('INSERT INTO tags (name) VALUES (?)').run(name);
-        res.json({ id: info.lastInsertRowid, name });
+        const info = db.prepare('INSERT INTO tags (name, category_id) VALUES (?, ?)').run(name, category_id || null);
+        res.json({ id: info.lastInsertRowid, name, category_id });
     } catch (error) {
         if (error.code === 'SQLITE_CONSTRAINT') {
             res.status(400).json({ error: '標籤名稱已存在' });
@@ -597,6 +656,7 @@ app.post('/api/tags', (req, res) => {
 app.delete('/api/tags/:id', (req, res) => {
     const { id } = req.params;
     try {
+        // First set references to NULL in transcript and documents before deleting (done by generic references, but sqlite handles SET NULL if PRAGMA foreign_keys is ON)
         db.prepare('DELETE FROM tags WHERE id = ?').run(id);
         res.json({ success: true });
     } catch (error) {
@@ -662,7 +722,12 @@ async function generateText(provider, prompt, systemInstruction) {
 }
 
 app.post('/api/chat', async (req, res) => {
-    let { message, thread_id, model = 'openai', tag_id } = req.body;
+    let { message, thread_id, model = 'openai', tag_id, filter_category_ids = [], filter_tag_ids = [] } = req.body;
+
+    // Backward compatibility for single tag_id selection
+    if (tag_id && filter_tag_ids.length === 0) {
+        filter_tag_ids = [tag_id];
+    }
 
     if (!message) {
         return res.status(400).json({ error: 'Message is required' });
@@ -688,7 +753,7 @@ app.post('/api/chat', async (req, res) => {
         const queryVector = queryEmbeddingResponse.data[0].embedding;
 
         // 4. Fetch all sources with embeddings
-        let transcriptQuery = "SELECT id, url as source_url, transcript as content, embedding, 'reel' as type, created_at FROM saved_transcripts WHERE embedding IS NOT NULL";
+        let transcriptQuery = "SELECT st.id, st.url as source_url, st.transcript as content, st.embedding, 'reel' as type, st.created_at FROM saved_transcripts st LEFT JOIN tags t ON st.tag_id = t.id WHERE st.embedding IS NOT NULL";
         // New: Query document_chunks for better precision
         let docChunkQuery = `
             SELECT 
@@ -702,21 +767,32 @@ app.post('/api/chat', async (req, res) => {
                 d.created_at 
             FROM document_chunks dc
             JOIN documents d ON dc.document_id = d.id
+            LEFT JOIN tags t ON d.tag_id = t.id
             WHERE dc.embedding IS NOT NULL
         `;
 
-        let transcripts, docChunks;
+        let filterClause = "";
+        const queryParams = [];
+        const conditions = [];
 
-        if (tag_id) {
-            transcriptQuery += " AND tag_id = ?";
-            transcripts = db.prepare(transcriptQuery).all(tag_id);
-
-            docChunkQuery += " AND d.tag_id = ?";
-            docChunks = db.prepare(docChunkQuery).all(tag_id);
-        } else {
-            transcripts = db.prepare(transcriptQuery).all();
-            docChunks = db.prepare(docChunkQuery).all();
+        if (filter_category_ids.length > 0) {
+            const placeholders = filter_category_ids.map(() => '?').join(',');
+            conditions.push(`t.category_id IN (${placeholders})`);
+            queryParams.push(...filter_category_ids);
         }
+
+        if (filter_tag_ids.length > 0) {
+            const placeholders = filter_tag_ids.map(() => '?').join(',');
+            conditions.push(`t.id IN (${placeholders})`);
+            queryParams.push(...filter_tag_ids);
+        }
+
+        if (conditions.length > 0) {
+            filterClause = ` AND (${conditions.join(' OR ')})`;
+        }
+
+        const transcripts = db.prepare(transcriptQuery + filterClause).all(...queryParams);
+        const docChunks = db.prepare(docChunkQuery + filterClause).all(...queryParams);
 
         const allSources = [...transcripts, ...docChunks];
 
@@ -842,6 +918,23 @@ app.get('/api/chat/threads/:id/messages', (req, res) => {
         res.json(formattedRows);
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+});
+
+app.patch('/api/chat/threads/:id', (req, res) => {
+    const { id } = req.params;
+    const { title } = req.body;
+
+    if (!title || title.trim() === '') {
+        return res.status(400).json({ error: 'Title is required' });
+    }
+
+    try {
+        db.prepare('UPDATE chat_threads SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(title.trim(), id);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('Database Error:', error);
+        res.status(500).json({ error: 'Failed to update thread title' });
     }
 });
 
